@@ -1,0 +1,50 @@
+name: Auto build evopt on upstream release
+
+on:
+  schedule: [ { cron: "17 6 * * *" } ]   # täglich 06:17 Europe/Berlin ±
+  workflow_dispatch: {}
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get latest upstream release tag
+        id: get
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const r = await github.rest.repos.getLatestRelease({ owner: "andig", repo: "evopt" });
+            core.setOutput("tag", r.data.tag_name);
+
+      - name: Skip if tag already on Docker Hub
+        id: skip
+        run: |
+          TAG="${{ steps.get.outputs.tag }}"
+          if docker manifest inspect litithio/evopt:${TAG} > /dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - uses: docker/setup-qemu-action@v3
+        if: steps.skip.outputs.exists == 'false'
+      - uses: docker/setup-buildx-action@v3
+        if: steps.skip.outputs.exists == 'false'
+      - uses: docker/login-action@v3
+        if: steps.skip.outputs.exists == 'false'
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build & push for latest upstream tag
+        if: steps.skip.outputs.exists == 'false'
+        uses: docker/build-push-action@v6
+        with:
+          context: https://github.com/andig/evopt.git#refs/tags/${{ steps.get.outputs.tag }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            litithio/evopt:latest
+            litithio/evopt:${{ steps.get.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
