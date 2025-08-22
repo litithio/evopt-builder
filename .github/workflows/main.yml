@@ -17,7 +17,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       sha: ${{ steps.get.outputs.sha }}
-      short: ${{ steps.get.outputs.short }}
     steps:
       - name: Get latest upstream main commit
         id: get
@@ -26,7 +25,6 @@ jobs:
           script: |
             const r = await github.rest.repos.getBranch({ owner: "andig", repo: "evopt", branch: "main" });
             core.setOutput("sha", r.data.commit.sha);
-            core.setOutput("short", r.data.commit.sha.substring(0,7));
 
   lint:
     needs: prep
@@ -45,6 +43,8 @@ jobs:
 
   build:
     needs: [prep, lint]
+    if: github.event_name != 'pull_request' &&
+        (github.event_name != 'push' || !contains(github.event.head_commit.message, '[skip ci]'))  # Guard gegen Auto-Commit-Loop
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -93,13 +93,13 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            litithio/evopt:${{ steps.semver.outputs.next }}        # SemVer (fix)
-            litithio/evopt:main                                    # beweglich
-            litithio/evopt:latest                                  # beweglich
-            litithio/evopt:sha-${{ needs.prep.outputs.short }}     # Referenz
+            litithio/evopt:${{ steps.semver.outputs.next }}   # SemVer (fix)
+            litithio/evopt:latest                             # beweglich
           labels: |
             org.opencontainers.image.version=${{ steps.semver.outputs.next }}
             org.opencontainers.image.revision=${{ needs.prep.outputs.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: Record processed SHA + version (and commit)
         if: steps.change.outputs.changed == 'true'
