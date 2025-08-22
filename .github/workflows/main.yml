@@ -41,7 +41,7 @@ jobs:
         with:
           dockerfile: src/Dockerfile
           ignore: DL3008,DL3015
-          failure-threshold: warning
+          failure-threshold: error
 
   build:
     needs: [prep, lint]
