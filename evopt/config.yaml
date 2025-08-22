@@ -10,6 +10,3 @@ ingress: true
 ingress_port: 7050
 
 image: "docker.io/litithio/{arch}-evopt-addon"
-
-options: {}
-schema: {}
