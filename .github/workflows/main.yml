@@ -95,8 +95,8 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            litithio/evopt:${{ steps.semver.outputs.next }}   # SemVer (fix)
-            litithio/evopt:latest                             # beweglich
+            litithio/evopt:${{ steps.semver.outputs.next }}
+            litithio/evopt:latest
           labels: |
             org.opencontainers.image.version=${{ steps.semver.outputs.next }}
             org.opencontainers.image.revision=${{ needs.prep.outputs.sha }}
