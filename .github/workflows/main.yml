@@ -40,6 +40,7 @@ jobs:
         uses: hadolint/hadolint-action@v3.1.0
         with:
           dockerfile: src/Dockerfile
+          failure-threshold: error
 
   build:
     needs: [prep, lint]
