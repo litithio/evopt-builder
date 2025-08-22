@@ -1,0 +1,15 @@
+name: "evopt"
+version: "main"
+slug: "evopt"
+description: "Optimizer-Backend für evcc"
+arch:
+  - amd64
+  - aarch64
+
+ingress: true
+ingress_port: 7050
+
+image: "docker.io/litithio/{arch}-evopt-addon"
+
+options: {}
+schema: {}
