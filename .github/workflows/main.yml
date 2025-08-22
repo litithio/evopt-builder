@@ -1,15 +1,24 @@
-name: Auto build evopt (track upstream main)
+name: Auto build evopt (track upstream main, SemVer + lint)
 
 on:
   schedule:
-    - cron: "17 6 * * *"   # täglich 08:17 Europa/Berlin (Cron läuft in UTC)
+    - cron: "0 14 * * *"   # ~16:00 Europe/Berlin (UTC)
   workflow_dispatch: {}
 
+concurrency:
+  group: evopt-main-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write   # für Auto-Commit der State-Dateien
+
 jobs:
-  build:
+  prep:
     runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.get.outputs.sha }}
+      short: ${{ steps.get.outputs.short }}
     steps:
-      # 1) Aktuellen Commit auf andig/evopt@main holen
       - name: Get latest upstream main commit
         id: get
         uses: actions/github-script@v7
@@ -19,39 +28,90 @@ jobs:
             core.setOutput("sha", r.data.commit.sha);
             core.setOutput("short", r.data.commit.sha.substring(0,7));
 
-      # 2) Überspringen, falls genau diese SHA schon als Image vorhanden ist
-      - name: Check if image for this SHA exists on Docker Hub
-        id: check
+  lint:
+    needs: prep
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch upstream at exact commit
         run: |
-          SHA='${{ steps.get.outputs.sha }}'
-          if docker manifest inspect litithio/evopt:${SHA} >/dev/null 2>&1; then
-            echo "exists=true" >> $GITHUB_OUTPUT
+          git clone --no-checkout https://github.com/andig/evopt.git src
+          cd src
+          git fetch --depth 1 origin ${{ needs.prep.outputs.sha }}
+          git checkout ${{ needs.prep.outputs.sha }}
+      - name: Lint Dockerfile with hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: src/Dockerfile
+
+  build:
+    needs: [prep, lint]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Skip, wenn dieser Upstream-SHA schon verarbeitet wurde
+      - name: Detect upstream change
+        id: change
+        run: |
+          mkdir -p .state
+          PREV_SHA="$(test -f .state/EVOPT_MAIN_LAST_SHA && cat .state/EVOPT_MAIN_LAST_SHA || echo '')"
+          CUR_SHA='${{ needs.prep.outputs.sha }}'
+          if [ "$CUR_SHA" = "$PREV_SHA" ]; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "No upstream change -> skipping build."
           else
-            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "changed=true" >> $GITHUB_OUTPUT
           fi
 
-      # 3) Nur bauen, wenn neu
+      # SemVer Patch-Bump (z.B. 0.1.7 -> 0.1.8)
+      - name: Compute next SemVer
+        id: semver
+        if: steps.change.outputs.changed == 'true'
+        run: |
+          CUR_VER="$(test -f .state/EVOPT_MAIN_VERSION && cat .state/EVOPT_MAIN_VERSION || echo '0.1.0')"
+          if [[ ! "$CUR_VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then CUR_VER="0.1.0"; fi
+          IFS='.' read -r MA MI PA <<< "$CUR_VER"
+          NEXT_VER="$MA.$MI.$((PA+1))"
+          echo "current=$CUR_VER" >> $GITHUB_OUTPUT
+          echo "next=$NEXT_VER" >> $GITHUB_OUTPUT
+
       - uses: docker/setup-qemu-action@v3
-        if: steps.check.outputs.exists == 'false'
+        if: steps.change.outputs.changed == 'true'
       - uses: docker/setup-buildx-action@v3
-        if: steps.check.outputs.exists == 'false'
+        if: steps.change.outputs.changed == 'true'
       - uses: docker/login-action@v3
-        if: steps.check.outputs.exists == 'false'
+        if: steps.change.outputs.changed == 'true'
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build & push multi-arch image
-        if: steps.check.outputs.exists == 'false'
+        if: steps.change.outputs.changed == 'true'
         uses: docker/build-push-action@v6
         with:
-          context: https://github.com/andig/evopt.git#${{ steps.get.outputs.sha }}
-          platforms: linux/amd64,linux/arm64      # nur amd64? -> "linux/amd64"
+          context: https://github.com/andig/evopt.git#${{ needs.prep.outputs.sha }}
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            litithio/evopt:latest
-            litithio/evopt:main
-            litithio/evopt:${{ steps.get.outputs.sha }}
-            litithio/evopt:sha-${{ steps.get.outputs.short }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+            litithio/evopt:${{ steps.semver.outputs.next }}        # SemVer (fix)
+            litithio/evopt:main                                    # beweglich
+            litithio/evopt:latest                                  # beweglich
+            litithio/evopt:sha-${{ needs.prep.outputs.short }}     # Referenz
+          labels: |
+            org.opencontainers.image.version=${{ steps.semver.outputs.next }}
+            org.opencontainers.image.revision=${{ needs.prep.outputs.sha }}
+
+      - name: Record processed SHA + version (and commit)
+        if: steps.change.outputs.changed == 'true'
+        run: |
+          echo '${{ needs.prep.outputs.sha }}' > .state/EVOPT_MAIN_LAST_SHA
+          echo '${{ steps.semver.outputs.next }}' > .state/EVOPT_MAIN_VERSION
+
+      - name: Commit state update
+        if: steps.change.outputs.changed == 'true'
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore(evopt main): release ${{ steps.semver.outputs.next }} for ${{ needs.prep.outputs.sha }} [skip ci]"
+          file_pattern: |
+            .state/EVOPT_MAIN_LAST_SHA
+            .state/EVOPT_MAIN_VERSION
