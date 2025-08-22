@@ -1,0 +1,54 @@
+name: Build HA Add-on images (EVopt)
+
+on:
+  schedule: [ { cron: "17 6 * * *" } ]   # täglich 08:17 Europe/Berlin (Cron läuft in UTC)
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: amd64   # HA-Arch-Name
+            platform: linux/amd64
+          - arch: aarch64
+            platform: linux/arm64
+    steps:
+      - name: Get latest upstream main commit
+        id: get
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const r = await github.rest.repos.getBranch({ owner: "andig", repo: "evopt", branch: "main" });
+            core.setOutput("sha", r.data.commit.sha);
+            core.setOutput("short", r.data.commit.sha.substring(0,7));
+
+      - name: Compute tags
+        id: meta
+        run: |
+          echo "TAG_MAIN=main" >> $GITHUB_OUTPUT
+          echo "TAG_SHA=sha-${{ steps.get.outputs.short }}" >> $GITHUB_OUTPUT
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build & push (${{ matrix.arch }})
+        uses: docker/build-push-action@v6
+        with:
+          context: https://github.com/andig/evopt.git#${{ steps.get.outputs.sha }}
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: |
+            docker.io/litithio/${{ matrix.arch }}-evopt-addon:${{ steps.meta.outputs.TAG_MAIN }}
+            docker.io/litithio/${{ matrix.arch }}-evopt-addon:${{ steps.meta.outputs.TAG_SHA }}
+          labels: |
+            io.hass.type=addon
+            io.hass.version=${{ steps.meta.outputs.TAG_MAIN }}
+            io.hass.arch=${{ matrix.arch }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
