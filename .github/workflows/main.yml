@@ -18,13 +18,15 @@ jobs:
     outputs:
       sha: ${{ steps.get.outputs.sha }}
     steps:
-      - name: Get latest upstream main commit
+      - name: Get latest upstream main commit (ls-remote)
         id: get
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const r = await github.rest.repos.getBranch({ owner: "andig", repo: "evopt", branch: "main" });
-            core.setOutput("sha", r.data.commit.sha);
+        run: |
+          SHA="$(git ls-remote https://github.com/andig/evopt.git refs/heads/main | cut -f1)"
+          if [ -z "$SHA" ]; then
+            echo "Failed to fetch upstream SHA"; exit 1
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Upstream main SHA: $SHA"
 
   lint:
     needs: prep
@@ -51,6 +53,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Ensure .state is not ignored
+        run: |
+          git check-ignore -v .state || true
+
       # Skip, wenn dieser Upstream-SHA schon verarbeitet wurde
       - name: Detect upstream change
         id: change
@@ -64,6 +70,12 @@ jobs:
           else
             echo "changed=true" >> $GITHUB_OUTPUT
           fi
+      - name: Debug show SHAs and state
+        run: |
+          echo "PREV_SHA=$(cat .state/EVOPT_MAIN_LAST_SHA 2>/dev/null || echo '<none>')"
+          echo "CUR_SHA=${{ needs.prep.outputs.sha }}"
+          echo "Changed? -> ${{ steps.change.outputs.changed }}"
+          git status --porcelain
 
       # SemVer Patch-Bump (z.B. 0.1.7 -> 0.1.8)
       - name: Compute next SemVer
