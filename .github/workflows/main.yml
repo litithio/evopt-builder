@@ -152,8 +152,8 @@ jobs:
           echo '${{ steps.semver.outputs.next }}' > .state/EVOPT_MAIN_VERSION
           echo "Wrote LAST_SHA=$(cat .state/EVOPT_MAIN_LAST_SHA)"
           echo "Wrote VERSION=$(cat .state/EVOPT_MAIN_VERSION)"
-
-      - name: Debug: list .state content (pre-commit)
+      
+      - name: Debug list .state content (pre-commit)
         if: steps.change.outputs.changed == 'true'
         run: |
           ls -la .state || true
