@@ -7,19 +7,14 @@ on:
       - 'evopt/**'
       - 'repository.yaml'
       - '.github/workflows/**'
-  pull_request:
-    paths:
-      - 'evopt/**'
-      - 'repository.yaml'
   schedule:
-    - cron: '0 14 * * *'   # 16:00 Europe/Berlin im Sommer
+    - cron: '0 14 * * *'
   workflow_dispatch: {}
 
 concurrency:
   group: evopt-ha-addon-${{ github.ref }}
   cancel-in-progress: true
 
-# git-auto-commit
 permissions:
   contents: write
 
@@ -35,9 +30,7 @@ jobs:
 
   build:
     needs: lint
-    # Nicht auf PR-Events bauen/pushen
-    if: github.event_name != 'pull_request' &&
-        (github.event_name != 'push' || !contains(github.event.head_commit.message, '[skip ci]'))  # optionaler Guard
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -47,38 +40,52 @@ jobs:
           - arch: aarch64
             platform: linux/arm64
     steps:
-      - name: Get latest upstream main commit
-        id: get
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const r = await github.rest.repos.getBranch({ owner: "andig", repo: "evopt", branch: "main" });
-            core.setOutput("sha", r.data.commit.sha);
-            core.setOutput("short", r.data.commit.sha.substring(0,7));
+      # 1) Aktuelle Upstream-SHA (HEAD von andig/evopt@main)
+      - name: Get latest upstream main commit (ls-remote)
+        id: upstream
+        run: |
+          SHA="$(git ls-remote https://github.com/andig/evopt.git refs/heads/main | cut -f1)"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Upstream main SHA: $SHA"
 
+      # 2) Repo auschecken (wir lesen/schreiben evopt/config.yaml & evopt/LAST_UPSTREAM_SHA)
       - uses: actions/checkout@v4
 
+      # 3) Sicherstellen, dass evopt/ nicht ignoriert (Debug)
+      - name: Ensure evopt/ is not ignored
+        run: git check-ignore -v evopt || true
+
+      # 4) Upstream-Änderung erkennen (State-Datei: evopt/LAST_UPSTREAM_SHA)
       - name: Detect upstream change
         id: change
         run: |
-          PREV_SHA="$(test -f evopt/LAST_UPSTREAM_SHA && cat evopt/LAST_UPSTREAM_SHA || echo '')"
-          CUR_SHA='${{ steps.get.outputs.sha }}'
-          if [ "$CUR_SHA" = "$PREV_SHA" ]; then
-            echo "changed=false" >> $GITHUB_OUTPUT
-          else
+          PREV="$(test -f evopt/LAST_UPSTREAM_SHA && cat evopt/LAST_UPSTREAM_SHA || echo '')"
+          CUR='${{ steps.upstream.outputs.sha }}'
+          echo "PREV_SHA=$PREV"
+          echo "CUR_SHA=$CUR"
+          if [ -n "$CUR" ] && [ "$CUR" != "$PREV" ]; then
             echo "changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Compute SemVer
+      # 5) Aktuelle Version aus config.yaml lesen und Patch bumpen
+      - name: Compute next SemVer (from config.yaml)
         id: semver
         if: steps.change.outputs.changed == 'true'
         run: |
-          CUR_VER=$(grep -E '^version:' evopt/config.yaml | sed -E 's/version:[[:space:]]*"?(.*)"?/\1/')
-          if [[ ! "$CUR_VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then CUR_VER="0.1.0"; fi
-          IFS='.' read -r MA MI PA <<< "$CUR_VER"
-          NEXT_VER="$MA.$MI.$((PA+1))"
-          echo "next=${NEXT_VER}" >> $GITHUB_OUTPUT
+          CUR=$(grep -E '^version:' evopt/config.yaml | sed -E 's/version:[[:space:]]*"?(.*)"?/\1/')
+          echo "Current version in config.yaml: $CUR"
+          if [[ ! "$CUR" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            CUR="0.1.0"
+            echo "No SemVer found, falling back to $CUR"
+          fi
+          IFS='.' read -r MA MI PA <<< "$CUR"
+          NEXT="$MA.$MI.$((PA+1))"
+          echo "next=$NEXT" >> $GITHUB_OUTPUT
+          echo "Next version: $NEXT"
 
+      # 6) QEMU/Buildx/Login
       - uses: docker/setup-qemu-action@v3
         if: steps.change.outputs.changed == 'true'
       - uses: docker/setup-buildx-action@v3
@@ -89,35 +96,47 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # 7) Build & Push Add-on Images (SemVer + optional latest)
       - name: Build & push (${{ matrix.arch }})
         if: steps.change.outputs.changed == 'true'
         uses: docker/build-push-action@v6
         with:
-          context: https://github.com/andig/evopt.git#${{ steps.get.outputs.sha }}
+          context: https://github.com/andig/evopt.git#${{ steps.upstream.outputs.sha }}
           platforms: ${{ matrix.platform }}
           push: true
           tags: |
             docker.io/litithio/${{ matrix.arch }}-evopt-addon:${{ steps.semver.outputs.next }}
-            docker.io/litithio/${{ matrix.arch }}-evopt-addon:main
+            docker.io/litithio/${{ matrix.arch }}-evopt-addon:latest
           labels: |
             io.hass.type=addon
             io.hass.version=${{ steps.semver.outputs.next }}
             io.hass.arch=${{ matrix.arch }}
-            org.opencontainers.image.revision=${{ steps.get.outputs.sha }}
+            org.opencontainers.image.revision=${{ steps.upstream.outputs.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Bump version in config.yaml & record SHA
+      # 8) version in config.yaml bumpen & Upstream-SHA persistieren
+      - name: Bump version in evopt/config.yaml & record upstream SHA
         if: steps.change.outputs.changed == 'true'
         run: |
           sed -i -E 's/^version:.*$/version: "${{ steps.semver.outputs.next }}"/' evopt/config.yaml
-          echo '${{ steps.get.outputs.sha }}' > evopt/LAST_UPSTREAM_SHA
+          echo '${{ steps.upstream.outputs.sha }}' > evopt/LAST_UPSTREAM_SHA
+          echo "config.yaml now:"
+          grep -E '^version:' evopt/config.yaml
 
+      # 9) Debug: Inhalte, bevor wir committen
+      - name: Debug: list evopt/ content
+        if: steps.change.outputs.changed == 'true'
+        run: |
+          ls -la evopt
+          echo "LAST_UPSTREAM_SHA=$(cat evopt/LAST_UPSTREAM_SHA 2>/dev/null || echo '<missing>')"
+
+      # 10) Committen (konkret die beiden Dateien)
       - name: Commit version bump
         if: steps.change.outputs.changed == 'true'
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "chore(addon): bump to ${{ steps.semver.outputs.next }} [skip ci]"
+          commit_message: "chore(addon): bump version to ${{ steps.semver.outputs.next }} [skip ci]"
           file_pattern: |
             evopt/config.yaml
             evopt/LAST_UPSTREAM_SHA
