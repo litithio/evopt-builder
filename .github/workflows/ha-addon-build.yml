@@ -40,7 +40,7 @@ jobs:
           - arch: aarch64
             platform: linux/arm64
     steps:
-      # 1) Aktuelle Upstream-SHA (HEAD von andig/evopt@main)
+      # 1) Upstream HEAD-SHA zuverlässig holen
       - name: Get latest upstream main commit (ls-remote)
         id: upstream
         run: |
@@ -48,14 +48,10 @@ jobs:
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "Upstream main SHA: $SHA"
 
-      # 2) Repo auschecken (wir lesen/schreiben evopt/config.yaml & evopt/LAST_UPSTREAM_SHA)
+      # 2) Unser Repo auschecken (wir lesen/schreiben evopt/*)
       - uses: actions/checkout@v4
 
-      # 3) Sicherstellen, dass evopt/ nicht ignoriert (Debug)
-      - name: Ensure evopt/ is not ignored
-        run: git check-ignore -v evopt || true
-
-      # 4) Upstream-Änderung erkennen (State-Datei: evopt/LAST_UPSTREAM_SHA)
+      # 3) Upstream-Änderung erkennen (State: evopt/LAST_UPSTREAM_SHA)
       - name: Detect upstream change
         id: change
         run: |
@@ -67,25 +63,34 @@ jobs:
             echo "changed=true" >> $GITHUB_OUTPUT
           else
             echo "changed=false" >> $GITHUB_OUTPUT
+            echo "No upstream change -> skipping build."
           fi
 
-      # 5) Aktuelle Version aus config.yaml lesen und Patch bumpen
+      # 4) Version aus config.yaml lesen und PATCH bumpen (robust)
       - name: Compute next SemVer (from config.yaml)
         id: semver
         if: steps.change.outputs.changed == 'true'
         run: |
-          CUR=$(grep -E '^version:' evopt/config.yaml | sed -E 's/version:[[:space:]]*"?(.*)"?/\1/')
-          echo "Current version in config.yaml: $CUR"
-          if [[ ! "$CUR" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            CUR="0.1.0"
-            echo "No SemVer found, falling back to $CUR"
+          set -e
+          if [ ! -f evopt/config.yaml ]; then
+            echo "config.yaml not found"; exit 1
           fi
+      
+          # robustes Auslesen der Version (nimmt nur die erste "version:" Zeile)
+          CUR="$(awk -F: '/^[[:space:]]*version[[:space:]]*:/ {gsub(/"/,"",$2); gsub(/[[:space:]]/,"",$2); print $2; exit}' evopt/config.yaml)"
+          echo "Current version in config.yaml: '${CUR}'"
+      
+          if [[ ! "$CUR" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "ERROR: version in config.yaml is not SemVer (got: '$CUR')" >&2
+            exit 1
+          fi
+
           IFS='.' read -r MA MI PA <<< "$CUR"
           NEXT="$MA.$MI.$((PA+1))"
           echo "next=$NEXT" >> $GITHUB_OUTPUT
           echo "Next version: $NEXT"
 
-      # 6) QEMU/Buildx/Login
+      # 5) Buildx / Login
       - uses: docker/setup-qemu-action@v3
         if: steps.change.outputs.changed == 'true'
       - uses: docker/setup-buildx-action@v3
@@ -96,7 +101,7 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # 7) Build & Push Add-on Images (SemVer + optional latest)
+      # 6) Build & Push mit SemVer + latest
       - name: Build & push (${{ matrix.arch }})
         if: steps.change.outputs.changed == 'true'
         uses: docker/build-push-action@v6
@@ -115,23 +120,24 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # 8) version in config.yaml bumpen & Upstream-SHA persistieren
+      # 7) Version in config.yaml setzen + SHA persistieren
       - name: Bump version in evopt/config.yaml & record upstream SHA
         if: steps.change.outputs.changed == 'true'
         run: |
           sed -i -E 's/^version:.*$/version: "${{ steps.semver.outputs.next }}"/' evopt/config.yaml
           echo '${{ steps.upstream.outputs.sha }}' > evopt/LAST_UPSTREAM_SHA
-          echo "config.yaml now:"
+          echo "Now in config.yaml:"
           grep -E '^version:' evopt/config.yaml
 
-      # 9) Debug: Inhalte, bevor wir committen
-      - name: Debug list evopt/ content
+      # 8) Debug: zeigen, was committet wird
+      - name: Debug list evopt/ (pre-commit)
         if: steps.change.outputs.changed == 'true'
         run: |
           ls -la evopt
           echo "LAST_UPSTREAM_SHA=$(cat evopt/LAST_UPSTREAM_SHA 2>/dev/null || echo '<missing>')"
+          git status --porcelain evopt
 
-      # 10) Committen (konkret die beiden Dateien)
+      # 9) Commit + Fallback
       - name: Commit version bump
         if: steps.change.outputs.changed == 'true'
         uses: stefanzweifel/git-auto-commit-action@v5
@@ -140,3 +146,12 @@ jobs:
           file_pattern: |
             evopt/config.yaml
             evopt/LAST_UPSTREAM_SHA
+      
+      - name: Fallback commit (if nothing staged)
+        if: steps.change.outputs.changed == 'true'
+        run: |
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name  "github-actions[bot]"
+          git add evopt/config.yaml evopt/LAST_UPSTREAM_SHA
+          git diff --cached --quiet || git commit -m "chore(addon): bump version to ${{ steps.semver.outputs.next }} [skip ci]"
+          git push
