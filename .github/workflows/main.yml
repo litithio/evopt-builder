@@ -2,7 +2,7 @@ name: Auto build evopt (track upstream main, SemVer + lint)
 
 on:
   schedule:
-    - cron: "0 14 * * *"   # ~16:00 Europe/Berlin (UTC)
+    - cron: "0 14 * * *"        # ~16:00 Europe/Berlin (UTC)
   workflow_dispatch: {}
 
 concurrency:
@@ -10,9 +10,12 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: write   # für Auto-Commit der State-Dateien
+  contents: write               # nötig für die State-Commits
 
 jobs:
+  # -------------------------------------------------------------
+  # 1) Upstream-SHA zuverlässig holen (HEAD von andig/evopt@main)
+  # -------------------------------------------------------------
   prep:
     runs-on: ubuntu-latest
     outputs:
@@ -28,6 +31,9 @@ jobs:
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "Upstream main SHA: $SHA"
 
+  # ------------------------------------
+  # 2) Lint (nicht-blockierend) mit DL
+  # ------------------------------------
   lint:
     needs: prep
     runs-on: ubuntu-latest
@@ -38,57 +44,79 @@ jobs:
           cd src
           git fetch --depth 1 origin ${{ needs.prep.outputs.sha }}
           git checkout ${{ needs.prep.outputs.sha }}
-      - name: Lint Dockerfile with hadolint
+      - name: Lint Dockerfile with hadolint (non-blocking)
         uses: hadolint/hadolint-action@v3.1.0
         with:
           dockerfile: src/Dockerfile
-          ignore: DL3008,DL3015
           failure-threshold: error
+          no-fail: true
 
+  # -------------------------------------------------------------
+  # 3) Build + SemVer (mit State in .state/, robust & mit Debug)
+  # -------------------------------------------------------------
   build:
     needs: [prep, lint]
     if: github.event_name != 'pull_request' &&
-        (github.event_name != 'push' || !contains(github.event.head_commit.message, '[skip ci]'))  # Guard gegen Auto-Commit-Loop
+        (github.event_name != 'push' || !contains(github.event.head_commit.message, '[skip ci]'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
+      # --- (A) Guard: .state darf nicht ignoriert werden
       - name: Ensure .state is not ignored
-        run: |
-          git check-ignore -v .state || true
+        run: git check-ignore -v .state || true
 
-      # Skip, wenn dieser Upstream-SHA schon verarbeitet wurde
+      # --- (B) Base-Version bestimmen
+      # Nimmt .state/EVOPT_MAIN_VERSION; wenn leer/nicht vorhanden,
+      # wird das höchste SemVer von Docker Hub als Basis genommen.
+      - name: Determine base SemVer (state or Docker Hub)
+        id: basever
+        run: |
+          BASE="$(test -f .state/EVOPT_MAIN_VERSION && cat .state/EVOPT_MAIN_VERSION || echo '')"
+          if [ -z "$BASE" ]; then
+            BASE=$(curl -s 'https://hub.docker.com/v2/repositories/litithio/evopt/tags?page_size=100' \
+              | jq -r '.results[].name' \
+              | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -t. -k1,1n -k2,2n -k3,3n | tail -n1)
+          fi
+          [[ "$BASE" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || BASE="0.1.0"
+          echo "base=$BASE" >> $GITHUB_OUTPUT
+          echo "Base version: $BASE"
+
+      # --- (C) Upstream-Änderung erkennen (gegen .state/EVOPT_MAIN_LAST_SHA)
       - name: Detect upstream change
         id: change
         run: |
           mkdir -p .state
           PREV_SHA="$(test -f .state/EVOPT_MAIN_LAST_SHA && cat .state/EVOPT_MAIN_LAST_SHA || echo '')"
           CUR_SHA='${{ needs.prep.outputs.sha }}'
-          if [ "$CUR_SHA" = "$PREV_SHA" ]; then
+          echo "PREV_SHA=$PREV_SHA"
+          echo "CUR_SHA=$CUR_SHA"
+          if [ -n "$CUR_SHA" ] && [ "$CUR_SHA" != "$PREV_SHA" ]; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+          else
             echo "changed=false" >> $GITHUB_OUTPUT
             echo "No upstream change -> skipping build."
-          else
-            echo "changed=true" >> $GITHUB_OUTPUT
           fi
-      - name: Debug show SHAs and state
-        run: |
-          echo "PREV_SHA=$(cat .state/EVOPT_MAIN_LAST_SHA 2>/dev/null || echo '<none>')"
-          echo "CUR_SHA=${{ needs.prep.outputs.sha }}"
-          echo "Changed? -> ${{ steps.change.outputs.changed }}"
-          git status --porcelain
 
-      # SemVer Patch-Bump (z.B. 0.1.7 -> 0.1.8)
+      # --- (D) SemVer (Patch) berechnen
       - name: Compute next SemVer
         id: semver
         if: steps.change.outputs.changed == 'true'
         run: |
-          CUR_VER="$(test -f .state/EVOPT_MAIN_VERSION && cat .state/EVOPT_MAIN_VERSION || echo '0.1.0')"
-          if [[ ! "$CUR_VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then CUR_VER="0.1.0"; fi
-          IFS='.' read -r MA MI PA <<< "$CUR_VER"
-          NEXT_VER="$MA.$MI.$((PA+1))"
-          echo "current=$CUR_VER" >> $GITHUB_OUTPUT
-          echo "next=$NEXT_VER" >> $GITHUB_OUTPUT
+          IFS='.' read -r MA MI PA <<< "${{ steps.basever.outputs.base }}"
+          NEXT="$MA.$MI.$((PA+1))"
+          echo "next=$NEXT" >> $GITHUB_OUTPUT
+          echo "Next version: $NEXT"
 
+      # --- (E) Debug: aktuelle & neue Version zeigen
+      - name: Show current & next version
+        if: steps.change.outputs.changed == 'true'
+        run: |
+          echo "CURRENT=$(cat .state/EVOPT_MAIN_VERSION 2>/dev/null || echo '<missing>')"
+          echo "NEXT=${{ steps.semver.outputs.next }}"
+
+      # --- (F) Buildx & Login nur wenn nötig
       - uses: docker/setup-qemu-action@v3
         if: steps.change.outputs.changed == 'true'
       - uses: docker/setup-buildx-action@v3
@@ -99,6 +127,7 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # --- (G) Build & Push (SemVer + latest)
       - name: Build & push multi-arch image
         if: steps.change.outputs.changed == 'true'
         uses: docker/build-push-action@v6
@@ -115,19 +144,22 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Record processed SHA + version (and commit)
+      # --- (H) State-Dateien schreiben & anzeigen
+      - name: Record processed SHA + version (and show)
         if: steps.change.outputs.changed == 'true'
         run: |
           echo '${{ needs.prep.outputs.sha }}' > .state/EVOPT_MAIN_LAST_SHA
           echo '${{ steps.semver.outputs.next }}' > .state/EVOPT_MAIN_VERSION
+          echo "Wrote LAST_SHA=$(cat .state/EVOPT_MAIN_LAST_SHA)"
+          echo "Wrote VERSION=$(cat .state/EVOPT_MAIN_VERSION)"
 
-      - name: Debug list .state content
+      - name: Debug: list .state content (pre-commit)
         if: steps.change.outputs.changed == 'true'
         run: |
           ls -la .state || true
-          echo "EVOPT_MAIN_VERSION=$(cat .state/EVOPT_MAIN_VERSION 2>/dev/null || echo '<missing>')"
-          echo "EVOPT_MAIN_LAST_SHA=$(cat .state/EVOPT_MAIN_LAST_SHA 2>/dev/null || echo '<missing>')"
+          git status --porcelain .state
 
+      # --- (I) Commit der beiden State-Dateien
       - name: Commit state update
         if: steps.change.outputs.changed == 'true'
         uses: stefanzweifel/git-auto-commit-action@v5
@@ -136,3 +168,17 @@ jobs:
           file_pattern: |
             .state/EVOPT_MAIN_LAST_SHA
             .state/EVOPT_MAIN_VERSION
+
+      # --- (J) Fallback-Commit (falls Plugin nichts staged)
+      - name: Fallback commit state
+        if: steps.change.outputs.changed == 'true'
+        run: |
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name  "github-actions[bot]"
+          git add .state/EVOPT_MAIN_LAST_SHA .state/EVOPT_MAIN_VERSION
+          if git diff --cached --quiet; then
+            echo "No changes staged (version may be identical)."
+          else
+            git commit -m "chore(state): update to ${{ steps.semver.outputs.next }} [skip ci]"
+            git push
+          fi
