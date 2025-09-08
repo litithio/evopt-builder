@@ -125,7 +125,7 @@ jobs:
           grep -E '^version:' evopt/config.yaml
 
       # 9) Debug: Inhalte, bevor wir committen
-      - name: Debug: list evopt/ content
+      - name: Debug list evopt/ content
         if: steps.change.outputs.changed == 'true'
         run: |
           ls -la evopt
