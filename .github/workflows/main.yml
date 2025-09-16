@@ -54,21 +54,30 @@ jobs:
   # -------------------------------------------------------------
   # 3) Build + SemVer (mit State in .state/, robust & mit Debug)
   # -------------------------------------------------------------
-  build:
+    build:
     needs: [prep, lint]
     if: github.event_name != 'pull_request' &&
         (github.event_name != 'push' || !contains(github.event.head_commit.message, '[skip ci]'))
     runs-on: ubuntu-latest
     steps:
+      # --- A) Checkout mit kompletter History auf main
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
 
-      # --- (A) Guard: .state darf nicht ignoriert werden
+      # --- B) Lokalen main-Historystand an origin/main angleichen (hart, robust gg. Force-Push)
+      - name: Align local main to origin/main
+        run: |
+          git fetch origin main
+          git checkout -B main
+          git reset --hard origin/main
+
+      # --- C) Guard: .state darf nicht ignoriert werden (dein Original)
       - name: Ensure .state is not ignored
         run: git check-ignore -v .state || true
 
-      # --- (B) Base-Version bestimmen
-      # Nimmt .state/EVOPT_MAIN_VERSION; wenn leer/nicht vorhanden,
-      # wird das höchste SemVer von Docker Hub als Basis genommen.
+      # --- D) Base-Version bestimmen (dein Original)
       - name: Determine base SemVer (state or Docker Hub)
         id: basever
         run: |
@@ -83,7 +92,7 @@ jobs:
           echo "base=$BASE" >> $GITHUB_OUTPUT
           echo "Base version: $BASE"
 
-      # --- (C) Upstream-Änderung erkennen (gegen .state/EVOPT_MAIN_LAST_SHA)
+      # --- E) Upstream-Änderung erkennen (dein Original)
       - name: Detect upstream change
         id: change
         run: |
@@ -99,7 +108,7 @@ jobs:
             echo "No upstream change -> skipping build."
           fi
 
-      # --- (D) SemVer (Patch) berechnen
+      # --- F) SemVer (dein Original)
       - name: Compute next SemVer
         id: semver
         if: steps.change.outputs.changed == 'true'
@@ -109,14 +118,13 @@ jobs:
           echo "next=$NEXT" >> $GITHUB_OUTPUT
           echo "Next version: $NEXT"
 
-      # --- (E) Debug: aktuelle & neue Version zeigen
       - name: Show current & next version
         if: steps.change.outputs.changed == 'true'
         run: |
           echo "CURRENT=$(cat .state/EVOPT_MAIN_VERSION 2>/dev/null || echo '<missing>')"
           echo "NEXT=${{ steps.semver.outputs.next }}"
 
-      # --- (F) Buildx & Login nur wenn nötig
+      # --- G) Buildx/Login nur bei Änderung (dein Original)
       - uses: docker/setup-qemu-action@v3
         if: steps.change.outputs.changed == 'true'
       - uses: docker/setup-buildx-action@v3
@@ -127,7 +135,7 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # --- (G) Build & Push (SemVer + latest)
+      # --- H) Build & Push (dein Original)
       - name: Build & push multi-arch image
         if: steps.change.outputs.changed == 'true'
         uses: docker/build-push-action@v6
@@ -144,7 +152,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # --- (H) State-Dateien schreiben & anzeigen
+      # --- I) State-Dateien schreiben & anzeigen (dein Original)
       - name: Record processed SHA + version (and show)
         if: steps.change.outputs.changed == 'true'
         run: |
@@ -152,14 +160,14 @@ jobs:
           echo '${{ steps.semver.outputs.next }}' > .state/EVOPT_MAIN_VERSION
           echo "Wrote LAST_SHA=$(cat .state/EVOPT_MAIN_LAST_SHA)"
           echo "Wrote VERSION=$(cat .state/EVOPT_MAIN_VERSION)"
-      
+
       - name: Debug list .state content (pre-commit)
         if: steps.change.outputs.changed == 'true'
         run: |
           ls -la .state || true
           git status --porcelain .state
 
-      # --- (I) Commit der beiden State-Dateien
+      # --- J) Auto-Commit gezielt auf main pushen (NEU: branch + force-with-lease)
       - name: Commit state update
         if: steps.change.outputs.changed == 'true'
         uses: stefanzweifel/git-auto-commit-action@v5
@@ -168,8 +176,10 @@ jobs:
           file_pattern: |
             .state/EVOPT_MAIN_LAST_SHA
             .state/EVOPT_MAIN_VERSION
+          branch: main
+          push_options: '--force-with-lease'
 
-      # --- (J) Fallback-Commit (falls Plugin nichts staged)
+      # --- K) Fallback (nur falls das Action-Plugin nichts staged) – pusht ebenfalls auf main
       - name: Fallback commit state
         if: steps.change.outputs.changed == 'true'
         run: |
@@ -180,5 +190,5 @@ jobs:
             echo "No changes staged (version may be identical)."
           else
             git commit -m "chore(state): update to ${{ steps.semver.outputs.next }} [skip ci]"
-            git push
+            git push origin HEAD:main --force-with-lease
           fi
