@@ -48,8 +48,11 @@ jobs:
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "Upstream main SHA: $SHA"
 
-      # 2) Unser Repo auschecken (wir lesen/schreiben evopt/*)
+      # 2) Unser Repo auschecken (volle History, explizit main)
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
 
       # 3) Upstream-Änderung erkennen (State: evopt/LAST_UPSTREAM_SHA)
       - name: Detect upstream change
@@ -75,11 +78,10 @@ jobs:
           if [ ! -f evopt/config.yaml ]; then
             echo "config.yaml not found"; exit 1
           fi
-      
-          # robustes Auslesen der Version (nimmt nur die erste "version:" Zeile)
+
           CUR="$(awk -F: '/^[[:space:]]*version[[:space:]]*:/ {gsub(/"/,"",$2); gsub(/[[:space:]]/,"",$2); print $2; exit}' evopt/config.yaml)"
           echo "Current version in config.yaml: '${CUR}'"
-      
+
           if [[ ! "$CUR" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "ERROR: version in config.yaml is not SemVer (got: '$CUR')" >&2
             exit 1
@@ -137,21 +139,36 @@ jobs:
           echo "LAST_UPSTREAM_SHA=$(cat evopt/LAST_UPSTREAM_SHA 2>/dev/null || echo '<missing>')"
           git status --porcelain evopt
 
-      # 9) Commit + Fallback
+      # 9) Vor dem Commit: lokalen main an origin/main angleichen
+      - name: Align local main to origin/main
+        if: steps.change.outputs.changed == 'true' && matrix.arch == 'amd64'
+        run: |
+          git fetch origin main
+          git checkout -B main
+          git reset --hard origin/main
+
+      # 10) Commit nur einmal (amd64) + sicher pushen
       - name: Commit version bump
-        if: steps.change.outputs.changed == 'true'
+        if: steps.change.outputs.changed == 'true' && matrix.arch == 'amd64'
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "chore(addon): bump version to ${{ steps.semver.outputs.next }} [skip ci]"
+          commit_message: "chore(addon): bump version to ${% raw %}{{ steps.semver.outputs.next }}{% endraw %} [skip ci]"
           file_pattern: |
             evopt/config.yaml
             evopt/LAST_UPSTREAM_SHA
-      
+          branch: main
+          push_options: '--force-with-lease'
+
+      # 11) Fallback (falls Action nichts staged) – ebenfalls nur einmal
       - name: Fallback commit (if nothing staged)
-        if: steps.change.outputs.changed == 'true'
+        if: steps.change.outputs.changed == 'true' && matrix.arch == 'amd64'
         run: |
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config user.name  "github-actions[bot]"
           git add evopt/config.yaml evopt/LAST_UPSTREAM_SHA
-          git diff --cached --quiet || git commit -m "chore(addon): bump version to ${{ steps.semver.outputs.next }} [skip ci]"
-          git push
+          if git diff --cached --quiet; then
+            echo "No changes staged."
+          else
+            git commit -m "chore(addon): bump version to ${{ steps.semver.outputs.next }} [skip ci]"
+            git push origin HEAD:main --force-with-lease
+          fi
